@@ -1,3 +1,23 @@
+----------------------------------------------------------------------------------
+-- Company: 
+-- Engineer: 
+-- 
+-- Create Date: 09/25/2021 02:26:58 PM
+-- Design Name: 
+-- Module Name: hal_task_nms - Behavioral
+-- Project Name: 
+-- Target Devices: 
+-- Tool Versions: 
+-- Description: 
+-- 
+-- Dependencies: 
+-- 
+-- Revision:
+-- Revision 0.01 - File Created
+-- Additional Comments:
+-- 
+----------------------------------------------------------------------------------
+
 library IEEE;
 use IEEE.STD_LOGIC_1164.ALL;
 use IEEE.NUMERIC_STD.ALL;
@@ -14,15 +34,13 @@ use hw_fast_v1_00_a.fast_pkg.RUN_BIT;
 use hw_fast_v1_00_a.fast_pkg.CONTROL_OFFSET;
 use hw_fast_v1_00_a.fast_pkg.array_slv_32_t;
 use hw_fast_v1_00_a.fast_pkg.array_slv_16_t;
-use hw_fast_v1_00_a.nms9;
+use hw_fast_v1_00_a.nms9_double;
 use hw_fast_v1_00_a.LOGICAL_FIFO32;
-use hw_fast_v1_00_a.LOGICAL_FIFO16;
-use hw_fast_v1_00_a.word_to_pixel;
 
 
 entity hal_task_nms is
 	generic(
-				TASK_ID				: string		:= "NonmaxSP";
+				TASK_ID				: string		:= "MNonmaxDP0";
 				C_DATA_IN_NWORDS	: natural 	:=4;
 				C_DATA_OUT_NWORDS	: natural	:=1;
 				--INTERNAL  PARAMETERS
@@ -39,8 +57,10 @@ entity hal_task_nms is
 			  ------------------------------------------------
 			  -- Custom ports
 			  i_wr_score          : in std_logic;
-              i_is_keypoint       : IN std_logic;
-              i_score             : IN std_logic_vector(15 downto 0);
+              i_is_keypoint0       : IN std_logic;
+              i_is_keypoint1       : IN std_logic;
+              i_pixel0_score             : IN std_logic_vector(15 downto 0);
+              i_pixel1_score             : IN std_logic_vector(15 downto 0);
               i_fast_done         : IN std_logic;
               o_ready_for_data    : out std_logic;
 			  ------------------------------------------------
@@ -77,12 +97,12 @@ end hal_task_nms;
 architecture Behavioral of hal_task_nms is
 
 
-constant C_BLOCK_LEN: natural :=2048;
-constant C_TRGT_UPLOAD_B: natural :=512;--C_BLOCK_LEN/8;
-CONSTANT C_TRGT_WCRNRS_W: NATURAL :=64;
-CONSTANT C_FIFO_OUT_DPTH: NATURAL :=4*C_TRGT_WCRNRS_W;
+constant C_BLOCK_LEN: natural :=131072;
+constant C_TRGT_UPLOAD_B: natural :=C_BLOCK_LEN;
+CONSTANT C_TRGT_WCRNRS_W: NATURAL :=256;
+CONSTANT C_FIFO_OUT_DPTH: NATURAL :=2*C_TRGT_WCRNRS_W;
 
-CONSTANT C_CONF_LEN: NATURAL RANGE 0 TO 65535 :=12;
+CONSTANT C_CONF_LEN: NATURAL RANGE 0 TO 65535 :=16;
 CONSTANT C_RAM_WIDTH: NATURAL := 13; 
 CONSTANT C_RESOLUTION_WIDTH: natural := 16;
 CONSTANT C_CIRCLE_DIAMETER: NATURAL := 7;
@@ -90,6 +110,8 @@ CONSTANT C_CIRCLE_DIAMETER: NATURAL := 7;
 type t_state is (s0_ready,s1_query_ofile,s2_query_conf,s3_read_config,s4_config_run, s5_check_crnrs_size,
 s7_write_corners,s8_unlock_rsrc_mutex, s9_check_upld_tgt,s10_fstream_async_write,s11_fstream_finalz_write, s12_eval_fstream_write, 
 s13_check_done, s14_wait_corners, s15_check_corners_last, s16_fstream_finwrite, s17_stop_fast_nms, s18_write_message,s90_print_stdio,s99_exit);
+
+
 
 signal ofile_d	:fstream_descriptor_t;
 signal ofile_q	:fstream_descriptor_t;
@@ -101,8 +123,6 @@ signal nms_state: t_state; --reg
 signal task_state_next: t_state; -- signal
 signal Done_d: boolean;
 signal Done_q: boolean;
-attribute mark_debug : string;
-attribute mark_debug of nms_state: signal is "true";
 
     
 -------------------------------------------------------------------------------------------------------
@@ -114,6 +134,8 @@ signal status_ret_q:integer;
 -------------------------------------------------------------------------------------------------------
 -- write corners signals, counters
 -------------------------------------------------------------------------------------------------------
+
+signal inc_last_windex_i: std_logic;
 signal inc_windex_i: std_logic;
 signal load_windex_i: std_logic;
 signal index_write_d : unsigned(POW2(C_TRGT_UPLOAD_B)-2 downto 0);
@@ -121,19 +143,20 @@ signal index_write_q:integer;
 signal remaining_space_d:integer;
 signal remaining_space_q:integer;
 
+signal blen_param_q: natural;
+
 signal count_crnrs_q :integer;
 signal count_crnrs_d : unsigned(31 downto 0);
 
 signal ofile_len_d :integer;
 signal ofile_len_q :integer;
 signal count_crnr_bytes_q :integer;
-signal count_crnr_bytes_d :UNSIGNED (POW2(C_FIFO_OUT_DPTH*4) DOWNTO 0);
+signal count_crnr_bytes_d :UNSIGNED (31 DOWNTO 0);
 
 signal fifo_out_burst_d  :  integer;
 signal fifo_out_burst_q  :  integer;
 
-
-signal r_address_offset_d:integer;
+signal r_address_offset_d:INTEGER;
 signal r_address_offset_q:integer;
 signal pending_transfer_d : integer range 0 to 3;
 signal pending_transfer_q : integer range 0 to 3;
@@ -144,8 +167,8 @@ signal dec_pending: std_logic;
 
 
 signal reset_i: std_logic;
-constant fmessage: string := "finished...(%d)\n";
-constant m_len: natural := fmessage'high + 4;
+constant fmessage: string := "finished...(%d,%d)\n";
+constant m_len: natural := fmessage'high + 8;
 
 signal data_out_i: t_array_slv_32(0 to C_DATA_OUT_NWORDS-1);
 signal data_in_i: t_array_slv_32(0 to C_DATA_IN_NWORDS-1);
@@ -156,15 +179,19 @@ signal resetn_i          : std_logic;
 
 -----------------------------------------------------------------------------------------------------------------------------
 --control channel
------------------------------------------------------------------------------------------------------------------------------
 signal WR_CE_i :  STD_LOGIC;
 signal OFFSET_i:  std_logic_vector(4 downto 2);
 signal control_data_i :  std_logic_vector(31 downto 0);
+signal pixels_word_d :  STD_LOGIC_VECTOR(31 DOWNTO 0);
+
 -----------------------------------------------------------------------------------------------------------------------------
+--nms
+----------------------------------------------------------------------------------------------------------------------------
 
 
+SIGNAL x_coord_ap_vld  :  STD_LOGIC;
+SIGNAL y_coord_ap_vld  :  STD_LOGIC;
 SIGNAL is_crnr_i  :  STD_LOGIC;
-
 SIGNAL nms_done_i :  STD_LOGIC;
 
 
@@ -178,7 +205,6 @@ SIGNAL fifo_size		: STD_LOGIC_VECTOR(POW2(C_FIFO_OUT_DPTH) downto 0);
 SIGNAL fifo_size_block_q		: integer;
 SIGNAL fifo_data_valid : STD_LOGIC;
 SIGNAL fifo_ready_for_data 	:   STD_LOGIC;
-
 signal corners_word_i: std_logic_vector(31 downto 0);
 
 signal wake_control_d: std_logic;
@@ -190,21 +216,26 @@ signal low_space_d: std_logic;
 signal upload_crnr_bytes_d :integer;
 signal upload_crnr_bytes_q :integer;
 
-signal i_ff1_data_port 	:   array_slv_16_t(0 to 1-1);
-signal o_ff1_data_port 	:  array_slv_16_t(0 to 1-1);
+signal i_ff1_data_port 	:   array_slv_32_t(0 to 1-1);
+signal o_ff1_data_port 	:  array_slv_32_t(0 to 1-1);
 signal o_ff1_data_valid    :   STD_LOGIC;
-signal score_dout 			:  STD_LOGIC_VECTOR (15 downto 0);
+signal score0_dout 			:  STD_LOGIC_VECTOR (15 downto 0);
+signal score1_dout 			:  STD_LOGIC_VECTOR (15 downto 0);
 signal score_read 			:  STD_LOGIC;
 signal run_q 			:  STD_LOGIC;
 
-signal is_corner 			:  STD_LOGIC_VECTOR (0 downto 0);
-signal is_corner_ap_vld 			:  STD_LOGIC;
-signal sc_coord_x_coord_din :  STD_LOGIC_VECTOR (15 downto 0);
-signal sc_coord_x_coord_full_n :  STD_LOGIC;
-signal sc_coord_x_coord_write :  STD_LOGIC;
-signal sc_coord_y_coord_din :  STD_LOGIC_VECTOR (15 downto 0);
-signal sc_coord_y_coord_full_n :  STD_LOGIC;
-signal sc_coord_y_coord_write :  STD_LOGIC;
+signal is_corner_full_n 			:  STD_LOGIC;
+signal is_corner_din 			:  STD_LOGIC_VECTOR (0 downto 0);
+signal is_corner_write 			:  STD_LOGIC;
+
+signal x_coord:  STD_LOGIC_VECTOR (15 downto 0);
+signal y_coord:  STD_LOGIC_VECTOR (15 downto 0);
+
+signal handshake_hls: integer;
+
+attribute mark_debug : string;
+attribute mark_debug of nms_state: signal is "true";
+attribute mark_debug of fifo_size: signal is "true";
 
 begin
 
@@ -254,15 +285,17 @@ begin
 	
 end process FSM_STATES;
 ------------------------------------------------------------------------------------------
---FSM_aSYNC_OUTPUTS: process(clock)
+--FSM_ASYNC_OUTPUTS: process(clock)
 ------------------------------------------------------------------------------------------
-				m00_task_done <= task_done_i;
-				m00_task_txdata <= array_32_to_slv(data_out_i);
-				m00_task_state <= STD_LOGIC_VECTOR(to_unsigned(t_state'pos(nms_state), C_TASK_STATE_NBITS));
 
---end process FSM_aSYNC_OUTPUTS;
+    m00_task_done <= task_done_i;
+    m00_task_txdata <= array_32_to_slv(data_out_i);
+    m00_task_state <= STD_LOGIC_VECTOR(to_unsigned(t_state'pos(nms_state), C_TASK_STATE_NBITS));
+
+
 ----------------------------------------------------------------------------------------
 data_in_i<= slv_to_array_32(s00_kernel_rxdata);
+
 
 ----------------------------------------------------------------------------------------
 CONTROL_STATE: process(nms_state,
@@ -403,7 +436,7 @@ end process CONTROL_STATE;
 EXTENEDED_FEATURES: process(resetn_i,nms_state, ofile_q, kernel_response, 
 					index_write_q, 	fifo_out_burst_q,corners_word_i,
 					ofile_len_q, r_address_offset_q, wake_control_q,
-					upload_crnr_bytes_q, count_crnrs_q)
+					upload_crnr_bytes_q, count_crnrs_q,handshake_hls)
 --------------------------------------------------------------------------------------------------------------------
 begin
 ofile_len_d <= ofile_len_q;
@@ -427,7 +460,7 @@ is_event_d <= false;
 				when s7_write_corners=>
 				    unsafe_write_sysram_word32_burst_fifo(kernel_call,kernel_response,corners_word_i,fifo_out_burst_q,index_write_q);
 				when s10_fstream_async_write=>
- 					async_pooled_fstream_write_sysram(kernel_call, kernel_response,ofile_q, upload_crnr_bytes_q,r_address_offset_q);
+ 					async_pooled_fstream_write_word32_sysram(kernel_call, kernel_response,ofile_q, upload_crnr_bytes_q/4,r_address_offset_q/4);
 				when s11_fstream_finalz_write=>
 					async_finalize_pooled_fstream_write_sysram(kernel_call, kernel_response);
 				    ofile_len_d <= cast_return_to_transfer_len(kernel_response);
@@ -437,7 +470,7 @@ is_event_d <= false;
 				    async_finalize_pooled_fstream_write_sysram(kernel_call, kernel_response);
    				    ofile_len_d <= cast_return_to_transfer_len(kernel_response);
 				when s18_write_message=>
-					safe_write_lram(kernel_call,kernel_response,fmessage,std_logic_vector(to_unsigned(count_crnrs_q,32)),0);
+					safe_write_lram(kernel_call,kernel_response,fmessage,std_logic_vector(to_unsigned(handshake_hls,32)) & std_logic_vector(to_unsigned(count_crnrs_q,32)),0);
 				when s90_print_stdio=>
 					write_stdio(kernel_call, kernel_response,fmessage'high,m_len,0);
 				when s99_exit=>
@@ -450,6 +483,7 @@ end process EXTENEDED_FEATURES;
 
 
 
+
 --------------------------------------------------------------------------
 INDEX_REGS:PROCESS(CLOCK)
 --------------------------------------------------------------------------
@@ -458,8 +492,9 @@ BEGIN
         if reset_i = '1' then
             ofile_q <=(fstream_obj,(others=>'0'),0,false);
         else
+            
             if kernel_response.block_task = '0'then 
-               ofile_q <=ofile_d;
+              ofile_q <=ofile_d;
             end if;
         end if;
         
@@ -467,6 +502,7 @@ BEGIN
 
 END PROCESS INDEX_REGS;
 --------------------------------------------------------------------------
+
 PENDING_CNTR:PROCESS(pending_transfer_q,inc_pending,dec_pending)
 variable sel: unsigned(1 downto 0);
 BEGIN
@@ -487,9 +523,11 @@ end case;
 
 END PROCESS PENDING_CNTR;
 --------------------------------------------------------------------------
-REM_SPACE:process(count_crnr_bytes_q)
+
+
+REM_SPACE:process(count_crnr_bytes_q,blen_param_q)
 begin
-remaining_space_d <= C_TRGT_UPLOAD_B - count_crnr_bytes_q;
+remaining_space_d <= blen_param_q - count_crnr_bytes_q;
 end process;
 --------------------------------------------------------------------------
 ------------------------------------------------------------------------------------
@@ -528,12 +566,12 @@ END PROCESS MUX_INDEX_OUT;
 
 wake_control_d <= '1' when to_integer(unsigned(fifo_size)) >=C_TRGT_WCRNRS_W or i_fast_done = '1' else '0';
 --------------------------------------------------------------------------
-MUX_ROFFSET:PROCESS(r_address_offset_q)
+MUX_ROFFSET:PROCESS(r_address_offset_q, blen_param_q)
 --------------------------------------------------------------------------
 BEGIN
 
 if r_address_offset_q = 0 then
-    r_address_offset_d <= C_TRGT_UPLOAD_B;
+    r_address_offset_d <= blen_param_q;
 else
     r_address_offset_d <=0;
 end if;
@@ -555,7 +593,7 @@ case sel is
     when "10" =>
        count_crnr_bytes_d<=(others=>'0');
      when "11" =>
-        count_crnr_bytes_d<=(others=>'0');
+       count_crnr_bytes_d<=(others=>'0');
     when others=>
         count_crnr_bytes_d <= to_unsigned(count_crnr_bytes_q,count_crnr_bytes_d'length);
 end case;
@@ -577,7 +615,7 @@ case inc_windex_i is
     end case;
 END PROCESS MUX_CORNER_OUT;
 --------------------------------------------------------------------------
-upload_crnr_bytes_d <= C_TRGT_UPLOAD_B when i_fast_done = '0' else count_crnr_bytes_q;
+upload_crnr_bytes_d <= to_integer(unsigned(data_in_i(3))) when i_fast_done = '0' else count_crnr_bytes_q;
 
 --------------------------------------------------------------------------
 TASK_REGS:process(clock)
@@ -592,23 +630,32 @@ begin
             index_write_q<= 0;
 			count_crnrs_q <= 0;
 			status_ret_q <= -1;
-			fifo_size_block_q <=0;
 			remaining_space_q <=0;
+			
 			fifo_out_burst_q <= 0;
 			r_address_offset_q <= 0;
 			wake_control_q <= '0';
 			is_event_q <= false;
-			upload_crnr_bytes_q <= 0;
+			upload_crnr_bytes_q <= C_TRGT_UPLOAD_B;
 		else
+		
+		    if(WR_CE_i = '1') then
+                blen_param_q <= to_integer(unsigned(data_in_i(3)));
+            end if;
+            if(WR_CE_i = '1') or i_fast_done ='1' then
+                upload_crnr_bytes_q <=upload_crnr_bytes_d;
+            end if;
+            
 		    wake_control_q <= wake_control_d;
             if  kernel_response.block_task = '1' or load_windex_i <= '1' then
-                
+
+
                 index_write_q <= TO_INTEGER(index_write_d);
                 count_crnr_bytes_q <=  TO_INTEGER(count_crnr_bytes_d);
                 remaining_space_q<=remaining_space_d;
             end if;
             if  kernel_response.block_task = '1'then
-                upload_crnr_bytes_q <=upload_crnr_bytes_d;
+                
                 count_crnrs_q <= TO_INTEGER(count_crnrs_d);
             end if;
             
@@ -616,13 +663,14 @@ begin
                 r_address_offset_q <= r_address_offset_d;
             end if;
             
-			if kernel_response.block_task = '0' then			    
+			if kernel_response.block_task = '0' then
 			    is_event_q <= is_event_d;
 			    low_space_q <= low_space_d;
-			     pending_transfer_q <= pending_transfer_d;
+			    pending_transfer_q <= pending_transfer_d;
 			    status_ret_q <= status_ret_d;
 			    fifo_out_burst_q <=  fifo_out_burst_d;
-				fifo_size_block_q <= to_integer(unsigned(fifo_size));
+			
+                fifo_size_block_q <= to_integer(unsigned(fifo_size));
 				ofile_len_q <= ofile_len_d;
 
 			end if;
@@ -633,10 +681,9 @@ end process TASK_REGS;
 --------------------------------------------------------------------------
 control_data_i <= config_d(to_integer(to_unsigned(kernel_response.index,2)));
 ----------------------------------------------------------------------------
-     i_ff1_data_port(0) <= i_score;
-     
+     i_ff1_data_port(0) <= i_pixel1_score &i_pixel0_score;
 ------------------------------------------------------------------------------------------------
-scores_ff:ENTITY logical_fifo16 
+scores_ff:ENTITY logical_fifo32 
 ------------------------------------------------------------------------------------------------
 generic map(
 				FIFO_DEPTH	=> 8, 
@@ -655,11 +702,10 @@ generic map(
                 o_data_valid    => o_ff1_data_valid,
                 o_ready_for_data=> o_ready_for_data);
 ------------------------------------------------------------------------------------------------
-score_dout <= o_ff1_data_port(0);
-  
+  score0_dout <= o_ff1_data_port(0)(15 downto 0);
+  score1_dout <= o_ff1_data_port(0)(31 downto 16);
 ------------------------------------------------------------------------------------------------
-unms:entity nms9 
-------------------------------------------------------------------------------------------------
+unms:entity nms9_double 
 port map(
     ap_clk 			=> clock 	  ,
     ap_rst 			=> reset_I 	  ,
@@ -667,22 +713,25 @@ port map(
     ap_done 		=> nms_done_i  ,
     ap_idle 		=> open 	  ,
     ap_ready 		=> open  ,
-    i_score_dout 		=>  score_dout,
-    i_score_empty_n 	=> o_ff1_data_valid,
-    i_score_read 		=> score_read ,
-    o_is_corner 		=> is_corner,
-    o_is_corner_ap_vld =>is_corner_ap_vld ,
-    o_coords_x_coord_full_n => fifo_ready_for_data,
-    o_coords_x_coord_din 	=> sc_coord_x_coord_din ,
-    o_coords_x_coord_write 	=> sc_coord_x_coord_write,
-    o_coords_y_coord_full_n => fifo_ready_for_data,
-    o_coords_y_coord_din 	=> sc_coord_y_coord_din ,
-    o_coords_y_coord_write 	=> sc_coord_y_coord_write);
+    score0_dout 		=>  score0_dout,
+    score0_empty_n 	=> o_ff1_data_valid,
+    score0_read 		=> score_read ,
+    score1_dout 		=>  score1_dout,
+    score1_empty_n 	=> o_ff1_data_valid,
+    score1_read 		=> open ,
+	is_corner_din 		=> is_corner_din,	
+    is_corner_full_n 	=> fifo_ready_for_data,	
+    is_corner_write 	=> is_corner_write,	
+    x_coord 			=> x_coord,	
+    x_coord_ap_vld 	    => x_coord_ap_vld,	
+    y_coord 			=> y_coord,	
+    y_coord_ap_vld 	    => y_coord_ap_vld);	
 ------------------------------------------------------------------------------------------------
 
-is_crnr_i <= is_corner(0);
-push_crnrs_i    <= is_crnr_i AND sc_coord_x_coord_write and sc_coord_y_coord_write;
-fifo_input_i(0)    <= sc_coord_y_coord_din & sc_coord_x_coord_din;
+
+is_crnr_i <= is_corner_din(0);
+push_crnrs_i    <= is_crnr_i AND x_coord_ap_vld and y_coord_ap_vld;
+fifo_input_i(0)    <= y_coord & x_coord;
 
 
 
@@ -726,5 +775,15 @@ corners_word_i <= fifo_output_i(0);
     end if;
  end process;
 ----------------------------------------------------------------------------
-
+------------------------------------------------------------------------
+HAND_REG:process(clock)
+------------------------------------------------------------------------
+begin
+  if reset_i =  '1' or nms_state = s1_query_ofile then
+            handshake_hls <= 0;
+        elsif nms_state = s16_fstream_finwrite and kernel_response.block_task = '1' then
+            handshake_hls <= handshake_hls + 1;
+        end if;
+end process HAND_REG;
+--------------------------------------------------------------------------
 end Behavioral;
